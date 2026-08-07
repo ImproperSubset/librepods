@@ -1,18 +1,57 @@
 #include "pulseaudiocontroller.h"
 #include "logger.h"
 #include <QThread>
+#include <QTimer>
+
+namespace {
+// A dead context cannot be revived (pa_context_connect requires
+// PA_CONTEXT_UNCONNECTED), so recovery means building a new one. Back off so a
+// server that is gone for good costs one attempt every 30s rather than a spin.
+constexpr int kReconnectInitialDelayMs = 1000;
+constexpr int kReconnectMaxDelayMs = 30000;
+// A server that accepts the socket but never finishes the handshake leaves the
+// context in a GOOD-but-not-READY state, which no state change ever breaks. The
+// reconnect timer can re-enter the wait at any time, so it needs a deadline.
+constexpr int kConnectTimeoutMs = 5000;
+
+struct ConnectTimeout
+{
+    pa_threaded_mainloop *mainloop;
+    bool expired;
+};
+
+// Runs on the mainloop thread with the lock held, so it may touch the caller's
+// stack: initialize() only releases the lock after freeing this event.
+void connectTimeoutCallback(pa_mainloop_api *, pa_time_event *, const struct timeval *, void *userdata)
+{
+    ConnectTimeout *timeout = static_cast<ConnectTimeout *>(userdata);
+    timeout->expired = true;
+    pa_threaded_mainloop_signal(timeout->mainloop, 0);
+}
+}
 
 PulseAudioController::PulseAudioController(QObject *parent)
-    : QObject(parent), m_mainloop(nullptr), m_context(nullptr), m_initialized(false)
+    : QObject(parent), m_mainloop(nullptr), m_context(nullptr), m_initialized(false),
+      m_reconnectTimer(nullptr), m_reconnectDelayMs(kReconnectInitialDelayMs)
 {
 }
 
 PulseAudioController::~PulseAudioController()
 {
+    teardown();
+}
+
+void PulseAudioController::teardown()
+{
+    // Clear this before releasing anything: entry points gate on it, so an
+    // early clear closes the window in which one could reach a mainloop that
+    // is being freed below.
+    m_initialized = false;
+
     // Stop the mainloop thread BEFORE touching the context. Every pa_* call
     // other than the mainloop's own lock/stop/free must be made with the lock
     // held; disconnecting the context while the poll loop is still running is a
-    // data race on it.
+    // data race on it. Stop must itself be called without the lock held.
     if (m_mainloop)
     {
         pa_threaded_mainloop_stop(m_mainloop);
@@ -31,15 +70,20 @@ PulseAudioController::~PulseAudioController()
         pa_threaded_mainloop_free(m_mainloop);
         m_mainloop = nullptr;
     }
-    m_initialized = false;
 }
 
 bool PulseAudioController::initialize()
 {
+    // Reconnects re-enter here, so start from nothing: leaving the previous
+    // mainloop allocated would leak it and its thread on every attempt.
+    teardown();
+
     m_mainloop = pa_threaded_mainloop_new();
     if (!m_mainloop)
     {
         LOG_ERROR("Failed to create PulseAudio mainloop");
+        teardown();
+        scheduleReconnect();
         return false;
     }
 
@@ -48,42 +92,111 @@ bool PulseAudioController::initialize()
     if (!m_context)
     {
         LOG_ERROR("Failed to create PulseAudio context");
+        teardown();
+        scheduleReconnect();
         return false;
     }
 
     pa_context_set_state_callback(m_context, contextStateCallback, this);
-    
+
     if (pa_threaded_mainloop_start(m_mainloop) < 0)
     {
         LOG_ERROR("Failed to start PulseAudio mainloop");
+        teardown();
+        scheduleReconnect();
         return false;
     }
 
     pa_threaded_mainloop_lock(m_mainloop);
-    
+
+    // pa_threaded_mainloop_wait has no timed variant: if the server never
+    // changes state nothing signals us and the wait never returns. Arm a
+    // mainloop time event so a stalled handshake cannot park the GUI thread.
+    ConnectTimeout timeout{m_mainloop, false};
+    // Monotonic rather than wallclock: this app autostarts at login, racing
+    // chrony's first correction, and a backward clock step would stretch the
+    // deadline by the size of the step.
+    pa_time_event *timeoutEvent = pa_context_rttime_new(
+        m_context, pa_rtclock_now() + static_cast<pa_usec_t>(kConnectTimeoutMs) * PA_USEC_PER_MSEC,
+        connectTimeoutCallback, &timeout);
+    if (!timeoutEvent)
+    {
+        // Continuing would mean the unbounded wait this exists to prevent, so
+        // fail the attempt and let the backoff retry rather than risk a hang.
+        LOG_ERROR("Could not arm the PulseAudio connect timeout");
+        pa_threaded_mainloop_unlock(m_mainloop);
+        teardown();
+        scheduleReconnect();
+        return false;
+    }
+
     if (pa_context_connect(m_context, nullptr, PA_CONTEXT_NOFLAGS, nullptr) < 0)
     {
         LOG_ERROR("Failed to connect to PulseAudio");
+        api->time_free(timeoutEvent);
         pa_threaded_mainloop_unlock(m_mainloop);
+        teardown();
+        scheduleReconnect();
         return false;
     }
 
     // Wait for context to be ready
     while (pa_context_get_state(m_context) != PA_CONTEXT_READY)
     {
-        if (!PA_CONTEXT_IS_GOOD(pa_context_get_state(m_context)))
+        const bool contextFailed = !PA_CONTEXT_IS_GOOD(pa_context_get_state(m_context));
+        if (contextFailed || timeout.expired)
         {
-            LOG_ERROR("PulseAudio context failed");
+            if (contextFailed)
+            {
+                LOG_ERROR("PulseAudio context failed");
+            }
+            else
+            {
+                LOG_ERROR("Timed out waiting for the PulseAudio context to become ready");
+            }
+            api->time_free(timeoutEvent);
             pa_threaded_mainloop_unlock(m_mainloop);
+            teardown();
+            scheduleReconnect();
             return false;
         }
         pa_threaded_mainloop_wait(m_mainloop);
     }
 
-    pa_threaded_mainloop_unlock(m_mainloop);
+    api->time_free(timeoutEvent);
+
+    // Set this while the lock is still held. State callbacks are dispatched
+    // with the mainloop lock held, so a FAILED transition cannot land between
+    // the loop seeing READY and the flag being set -- which would otherwise
+    // leave the flag true on a dead context with no reconnect armed.
     m_initialized = true;
+    m_reconnectDelayMs = kReconnectInitialDelayMs;
+    pa_threaded_mainloop_unlock(m_mainloop);
     LOG_INFO("PulseAudio controller initialized");
     return true;
+}
+
+void PulseAudioController::scheduleReconnect()
+{
+    if (m_initialized)
+    {
+        return;
+    }
+    if (!m_reconnectTimer)
+    {
+        m_reconnectTimer = new QTimer(this);
+        m_reconnectTimer->setSingleShot(true);
+        connect(m_reconnectTimer, &QTimer::timeout, this, [this]() {
+            LOG_INFO("Reconnecting to PulseAudio");
+            initialize();
+        });
+    }
+    if (m_reconnectTimer->isActive())
+    {
+        return;
+    }
+    m_reconnectTimer->start(m_reconnectDelayMs);
+    m_reconnectDelayMs = qMin(m_reconnectDelayMs * 2, kReconnectMaxDelayMs);
 }
 
 void PulseAudioController::contextStateCallback(pa_context *c, void *userdata)
@@ -91,9 +204,10 @@ void PulseAudioController::contextStateCallback(pa_context *c, void *userdata)
     PulseAudioController *controller = static_cast<PulseAudioController*>(userdata);
 
     // If the server goes away (pipewire-pulse restart or crash), the context
-    // stays FAILED forever. Without clearing m_initialized every later call
-    // proceeds, gets a null operation back, and returns empty -- permanently
-    // and silently. Record it so callers can see the controller is dead.
+    // stays FAILED forever -- libpulse will not revive it, and pa_context_connect
+    // rejects anything but an UNCONNECTED context. Without clearing
+    // m_initialized every later call proceeds, gets a null operation back, and
+    // returns empty -- permanently and silently.
     const pa_context_state_t state = pa_context_get_state(c);
     if (state == PA_CONTEXT_FAILED || state == PA_CONTEXT_TERMINATED)
     {
@@ -103,6 +217,11 @@ void PulseAudioController::contextStateCallback(pa_context *c, void *userdata)
                       << "); audio control is unavailable until reconnected");
         }
         controller->m_initialized = false;
+        // This runs on the mainloop thread with the mainloop lock held. Tearing
+        // the mainloop down from inside it would deadlock, so hand the work to
+        // the GUI thread, which owns every other pa_* call this class makes.
+        QMetaObject::invokeMethod(controller, &PulseAudioController::scheduleReconnect,
+                                  Qt::QueuedConnection);
     }
 
     pa_threaded_mainloop_signal(controller->m_mainloop, 0);

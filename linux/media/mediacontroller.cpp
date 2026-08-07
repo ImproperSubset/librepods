@@ -400,15 +400,33 @@ void MediaController::restoreProfileIfWeTurnedItOff() {
   if (!m_weTurnedItOff || m_deviceOutputName.isEmpty()) {
     return;
   }
-  if (m_pulseAudio->getActiveCardProfile(m_deviceOutputName) != "off") {
+  const QString activeProfile = m_pulseAudio->getActiveCardProfile(m_deviceOutputName);
+  if (activeProfile.isEmpty()) {
+    // Either the card is already gone -- PipeWire tears it down on the same
+    // BlueZ disconnect that brought us here, and usually wins that race -- or
+    // the PulseAudio context is down. Both are unobservable, not "the user
+    // changed it": there is nothing to read and nothing we can set. WirePlumber
+    // may keep "off" persisted; the activation chain run on every connect
+    // corrects it next time this app is running.
+    LOG_WARN("Cannot restore profile on '" << m_deviceOutputName
+             << "': card or context unavailable; a persisted 'off' may remain until next connect");
+    return;
+  }
+  if (activeProfile != "off") {
     return; // something else already changed it; leave the user's choice alone
   }
   const QString profile = getPreferredA2dpProfile();
   if (profile.isEmpty()) {
     return;
   }
-  LOG_INFO("Restoring A2DP profile on shutdown so the card is not left off: " << profile);
-  m_pulseAudio->setCardProfile(m_deviceOutputName, profile);
+  // Report the outcome, not the attempt: on a disconnect the card can still be
+  // readable above and yet reject the set microseconds later, mid-teardown.
+  if (m_pulseAudio->setCardProfile(m_deviceOutputName, profile)) {
+    LOG_INFO("Restored A2DP profile so the card is not left off: " << profile);
+  } else {
+    LOG_WARN("Could not restore A2DP profile on '" << m_deviceOutputName
+             << "' (card mid-teardown or gone); a persisted 'off' may remain until next connect");
+  }
   m_weTurnedItOff = false;
 }
 
