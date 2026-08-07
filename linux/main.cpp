@@ -1,6 +1,11 @@
 #include <QSettings>
 #include <QLocalServer>
 #include <QLocalSocket>
+#include <QSocketNotifier>
+#include <csignal>
+#include <cstring>
+#include <unistd.h>
+#include <sys/socket.h>
 #include <QApplication>
 #include <QQmlApplicationEngine>
 #include <QQmlContext>
@@ -34,6 +39,65 @@
 using namespace AirpodsTrayApp::Enums;
 
 Q_LOGGING_CATEGORY(librepods, "librepods")
+
+// SIGTERM/SIGINT self-pipe. `systemctl --user stop` sends SIGTERM, whose
+// default disposition kills the process outright -- no unwinding, no
+// aboutToQuit. Without this, shutdown cleanup simply never runs for the most
+// common stop path. Only async-signal-safe calls may appear in the handler,
+// hence the write-a-byte-and-return shape.
+namespace {
+int g_signalFd[2] = {-1, -1};
+
+void unixSignalHandler(int)
+{
+    const char byte = 1;
+    const ssize_t written = ::write(g_signalFd[1], &byte, 1);
+    Q_UNUSED(written);
+}
+
+// Routes SIGTERM/SIGINT into QCoreApplication::quit() via the Qt event loop.
+// Returns false if the plumbing could not be set up, in which case the app
+// still runs -- it just loses the graceful stop path.
+bool installTerminationHandler(QCoreApplication *app)
+{
+    if (::socketpair(AF_UNIX, SOCK_STREAM, 0, g_signalFd) != 0)
+    {
+        LOG_WARN("Could not create signal socketpair; SIGTERM will not shut down cleanly");
+        return false;
+    }
+
+    auto *notifier = new QSocketNotifier(g_signalFd[0], QSocketNotifier::Read, app);
+    QObject::connect(notifier, &QSocketNotifier::activated, app, [app, notifier]() {
+        notifier->setEnabled(false);
+        char byte;
+        const ssize_t bytesRead = ::read(g_signalFd[0], &byte, 1);
+        Q_UNUSED(bytesRead);
+        LOG_INFO("Termination signal received, shutting down");
+        app->quit();
+    });
+
+    struct sigaction sa;
+    ::memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = unixSignalHandler;
+    ::sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESTART;
+    if (::sigaction(SIGTERM, &sa, nullptr) != 0 || ::sigaction(SIGINT, &sa, nullptr) != 0)
+    {
+        LOG_WARN("Could not install termination signal handlers");
+        return false;
+    }
+    return true;
+}
+}
+
+namespace {
+// How long an L2CAP connection must stay up before its retry budget is
+// refunded. Shorter than this and a flapping device refunds on every accept.
+constexpr int kConnectionStableMs = 10000;
+// Exponential backoff between reconnect attempts, capped.
+constexpr int kRetryBaseMs = 1500;
+constexpr int kRetryMaxMs = 12000;
+}
 
 class AirPodsTrayApp : public QObject {
     Q_OBJECT
@@ -105,8 +169,7 @@ public:
                 // On startup after reboot, activate A2DP profile for already connected AirPods
                 QTimer::singleShot(2000, this, [this, address]()
                 {
-                    QString formattedAddress = address.toString().replace(":", "_");
-                    mediaController->setConnectedDeviceMacAddress(formattedAddress);
+                    mediaController->setConnectedDeviceMacAddress(address.toString());
                     mediaController->activateA2dpProfile();
                     LOG_INFO("A2DP profile activation attempted for AirPods found on startup");
                 });
@@ -240,6 +303,9 @@ public slots:
 
     void setRetryAttempts(int attempts)
     {
+        // Bound here rather than trusting the caller: this is also fed from
+        // QSettings, which is a plain text file the QML spin box does not gate.
+        attempts = qBound(1, attempts, 10);
         if (m_retryAttempts != attempts)
         {
             LOG_DEBUG("Setting retry attempts to: " << attempts);
@@ -427,7 +493,7 @@ public slots:
         if (areAirpodsConnected() && m_deviceInfo && !m_deviceInfo->bluetoothAddress().isEmpty())
         {
             LOG_INFO("AirPods already connected after wake-up, re-activating A2DP profile");
-            mediaController->setConnectedDeviceMacAddress(m_deviceInfo->bluetoothAddress().replace(":", "_"));
+            mediaController->setConnectedDeviceMacAddress(m_deviceInfo->bluetoothAddress());
 
             // Always activate A2DP profile after system wake since the profile might have been lost
             QTimer::singleShot(1000, this, [this]()
@@ -494,9 +560,7 @@ private slots:
         {
             if (!address.isEmpty())
             {
-                QString formattedAddress = address;
-                formattedAddress = formattedAddress.replace(":", "_");
-                mediaController->setConnectedDeviceMacAddress(formattedAddress);
+                mediaController->setConnectedDeviceMacAddress(address);
                 mediaController->activateA2dpProfile();
                 LOG_INFO("A2DP profile activation attempted for newly connected device");
             }
@@ -509,9 +573,22 @@ private slots:
         if (socket)
         {
             LOG_WARN("Socket is still open, closing it");
+            // Drop our handlers before closing: otherwise the orphaned socket's
+            // error signal still reaches handleError, which would consume the
+            // shared retry budget and reconnect to a device the user just
+            // disconnected. Without deleteLater the object leaked, too.
+            disconnect(socket, nullptr, this, nullptr);
             socket->close();
+            socket->deleteLater();
             socket = nullptr;
         }
+        // Invalidate any armed retry timer and any pending stability refund.
+        // Deliberately no bare `m_retryCount = 0` here: an unconditional refund
+        // is what let a flapping device retry without bound.
+        m_connectionGeneration++;
+        // The bluez card is gone; a cached card name here would make every
+        // later profile call target a destroyed card.
+        mediaController->clearConnectedDevice();
         if (phoneSocket && phoneSocket->isOpen())
         {
             phoneSocket->write(AirPodsPackets::Connection::AIRPODS_DISCONNECTED);
@@ -532,7 +609,10 @@ private slots:
 
     void bluezDeviceDisconnected(const QString &address, const QString &name)
     {
-        if (address == m_deviceInfo->bluetoothAddress())
+        // Case-insensitive: this guard gates the entire disconnect path, and
+        // the two sides come from different producers (BlueZ's Address property
+        // vs QBluetoothAddress::toString()).
+        if (address.compare(m_deviceInfo->bluetoothAddress(), Qt::CaseInsensitive) == 0)
         {
             onDeviceDisconnected(QBluetoothAddress(address));
         } else {
@@ -608,9 +688,13 @@ private slots:
 
         LOG_INFO("Connecting to device: " << device.name());
 
-        // Clean up any existing socket
+        // Clean up any existing socket. Detach our handlers first: closing a
+        // socket still in ConnectingState emits errorOccurred, which would run
+        // the old socket's handleError and arm a second, competing retry timer
+        // against the same counter.
         if (socket)
         {
+            disconnect(socket, nullptr, this, nullptr);
             socket->close();
             socket->deleteLater();
             socket = nullptr;
@@ -622,6 +706,18 @@ private slots:
         // Connection handler
         auto handleConnection = [this, localSocket]()
         {
+            // Do NOT reset the retry budget here. A device that accepts the
+            // L2CAP connection and then immediately errors would refund the
+            // budget on every accept and reconnect forever. Refund only once
+            // the link has proven stable; handleError bumps the generation so
+            // this cannot fire for a connection that already failed.
+            const int stableGeneration = ++m_connectionGeneration;
+            QTimer::singleShot(kConnectionStableMs, this, [this, stableGeneration]() {
+                if (stableGeneration == m_connectionGeneration)
+                {
+                    m_retryCount = 0;
+                }
+            });
             connect(localSocket, &QBluetoothSocket::readyRead, this, [this, localSocket]()
                     {
             QByteArray data = localSocket->readAll();
@@ -635,22 +731,48 @@ private slots:
         {
             LOG_ERROR("Socket error: " << error << ", " << localSocket->errorString());
 
-            static int retryCount = 0;
-            if (retryCount < m_retryAttempts)
+            // Invalidate any pending stability timer: this connection attempt
+            // failed, so it must not refund the retry budget.
+            m_connectionGeneration++;
+
+            if (m_retryCount < m_retryAttempts)
             {
-                retryCount++;
-                LOG_INFO("Retrying connection (attempt " << retryCount << ")");
-                QTimer::singleShot(1500, this, [this, device]()
-                                   { connectToDevice(device); });
+                m_retryCount++;
+                // Back off rather than hammering at a fixed cadence: a device
+                // that keeps refusing would otherwise spin at 1.5s forever and
+                // flood the journal.
+                // Clamp the exponent, not the product: retryAttempts comes from
+                // a hand-editable config file, and a large value would overflow
+                // the shift into a negative delay that silently kills the chain.
+                const int shift = qMin(m_retryCount - 1, 16);
+                const int delayMs = qMin(kRetryBaseMs << shift, kRetryMaxMs);
+                LOG_INFO("Retrying connection in " << delayMs << "ms (attempt "
+                         << m_retryCount << " of " << m_retryAttempts << ")");
+                const int retryGeneration = m_connectionGeneration;
+                QTimer::singleShot(delayMs, this, [this, device, retryGeneration]()
+                                   {
+                                       // A disconnect (or a newer attempt) since
+                                       // this was armed means the reconnect is no
+                                       // longer wanted -- issuing it would page a
+                                       // device the user just disconnected.
+                                       if (retryGeneration != m_connectionGeneration) { return; }
+                                       connectToDevice(device);
+                                   });
             }
             else
             {
-                LOG_ERROR("Failed to connect after 3 attempts");
-                retryCount = 0;
+                LOG_ERROR("Failed to connect after " << m_retryAttempts << " attempts");
+                m_retryCount = 0;
             }
         };
 
         connect(localSocket, &QBluetoothSocket::connected, this, handleConnection);
+        // A clean drop emits `disconnected`, not `errorOccurred`, so without
+        // this a link that comes up and dies would still collect its stability
+        // refund and start the retry budget over.
+        connect(localSocket, &QBluetoothSocket::disconnected, this, [this]() {
+            m_connectionGeneration++;
+        });
         connect(localSocket, QOverload<QBluetoothSocket::SocketError>::of(&QBluetoothSocket::errorOccurred),
                 this, handleError);
 
@@ -738,7 +860,7 @@ private slots:
         {
             parseMetadata(data);
             initiateMagicPairing();
-            mediaController->setConnectedDeviceMacAddress(m_deviceInfo->bluetoothAddress().replace(":", "_"));
+            mediaController->setConnectedDeviceMacAddress(m_deviceInfo->bluetoothAddress());
             if (m_deviceInfo->getEarDetection()->oneOrMorePodsInEar()) // AirPods get added as output device only after this
             {
                 mediaController->activateA2dpProfile();
@@ -970,6 +1092,19 @@ signals:
     void phoneMacStatusChanged();
     void hearingAidEnabledChanged(bool enabled);
 
+public:
+    // Runs on aboutToQuit, i.e. before QML/engine teardown. The MediaController
+    // destructor is not a reliable place for this: SIGTERM (what
+    // `systemctl --user stop` sends) terminates the process without unwinding,
+    // so nothing would hand the profile back on a service restart.
+    void handleAboutToQuit()
+    {
+        if (mediaController)
+        {
+            mediaController->restoreProfileIfWeTurnedItOff();
+        }
+    }
+
 private:
     QBluetoothSocket *socket = nullptr;
     QBluetoothSocket *phoneSocket = nullptr;
@@ -981,6 +1116,13 @@ private:
     QSettings *m_settings;
     AutoStartManager *m_autoStartManager;
     int m_retryAttempts = 3;
+    // Retry budget for one connection episode. Refunded only once a connection
+    // has stayed up for kConnectionStableMs -- refunding on bare `connected`
+    // lets a device that accepts then immediately drops retry forever, and
+    // never refunding leaves later reconnects with fewer attempts than
+    // configured (the original defect: a function-local `static`).
+    int m_retryCount = 0;
+    int m_connectionGeneration = 0;
     bool m_hideOnStart = false;
     DeviceInfo *m_deviceInfo;
     BleManager *m_bleManager;
@@ -1118,6 +1260,12 @@ int main(int argc, char *argv[]) {
             LOG_ERROR("Server failed to accept a new connection");
             LOG_DEBUG("Server error: " << server.errorString());
         });
+    });
+
+    installTerminationHandler(&app);
+
+    QObject::connect(&app, &QCoreApplication::aboutToQuit, trayApp, [trayApp]() {
+        trayApp->handleAboutToQuit();
     });
 
     QObject::connect(&app, &QCoreApplication::aboutToQuit, [&]() {
