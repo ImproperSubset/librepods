@@ -7,9 +7,20 @@
 #include <QDebug>
 #include <QProcess>
 #include <QThread>
+#include <QTimer>
 #include <QRegularExpression>
 #include <QDBusConnection>
 #include <QDBusConnectionInterface>
+
+namespace {
+// The bluez card typically appears within a second or two of the link coming
+// up; this budget covers a slow connect without retrying indefinitely.
+constexpr int kA2dpActivationAttempts = 10;
+constexpr int kA2dpActivationRetryMs = 500;
+// Restarting WirePlumber is machine-wide and blocking; never do it repeatedly.
+constexpr int kWirePlumberRestartMinIntervalMs = 60000;
+constexpr int kWirePlumberRestartTimeoutMs = 5000;
+}
 
 MediaController::MediaController(QObject *parent) : QObject(parent) {
   m_pulseAudio = new PulseAudioController(this);
@@ -30,9 +41,13 @@ void MediaController::handleEarDetection(EarDetection *earDetection)
   bool primaryInEar = earDetection->isPrimaryInEar();
   bool secondaryInEar = earDetection->isSecondaryInEar();
 
+  // Query once and reuse: each call is two blocking IPC round trips, and
+  // re-querying would also let the three uses below disagree within one packet.
+  const bool airpodsActive = isActiveOutputDeviceAirPods();
+
   LOG_DEBUG("Ear detection status: primaryInEar="
             << primaryInEar << ", secondaryInEar=" << secondaryInEar
-            << ", isAirPodsActive=" << isActiveOutputDeviceAirPods());
+            << ", isAirPodsActive=" << airpodsActive);
 
   // First handle playback pausing based on selected behavior
   bool shouldPause = false;
@@ -49,7 +64,7 @@ void MediaController::handleEarDetection(EarDetection *earDetection)
     shouldResume = primaryInEar || secondaryInEar;
   }
 
-  if (shouldPause && isActiveOutputDeviceAirPods())
+  if (shouldPause && airpodsActive)
   {
     if (getCurrentMediaState() == Playing)
     {
@@ -64,7 +79,9 @@ void MediaController::handleEarDetection(EarDetection *earDetection)
     LOG_INFO("At least one AirPod is in ear");
     activateA2dpProfile();
 
-    // Resume if conditions are met and we previously paused
+    // Re-query rather than reusing the value from the top of this function:
+    // activateA2dpProfile() above may have just made the AirPods the active
+    // output, which is precisely the case where a resume is wanted.
     if (shouldResume && !pausedByAppServices.isEmpty() && isActiveOutputDeviceAirPods())
     {
       play();
@@ -95,9 +112,19 @@ void MediaController::followMediaChanges() {
 }
 
 bool MediaController::isActiveOutputDeviceAirPods() {
-  QString defaultSink = m_pulseAudio->getDefaultSink();
-  LOG_DEBUG("Default sink: " << defaultSink);
-  return defaultSink.contains(connectedDeviceMacAddress);
+  if (connectedDeviceMacAddress.isEmpty()) {
+    return false;
+  }
+  QString defaultSinkMacAddress = m_pulseAudio->getDefaultSinkMacAddress();
+  LOG_DEBUG("Default sink MAC address: " << defaultSinkMacAddress);
+  if (defaultSinkMacAddress.isEmpty()) {
+    return false;
+  }
+  // Accept either separator: the sink property is colon-form, but fall back to
+  // the underscored form the card path also tolerates.
+  return defaultSinkMacAddress.compare(connectedDeviceMacAddress, Qt::CaseInsensitive) == 0 ||
+         defaultSinkMacAddress.compare(QString(connectedDeviceMacAddress).replace(':', '_'),
+                                       Qt::CaseInsensitive) == 0;
 }
 
 void MediaController::handleConversationalAwareness(const QByteArray &data) {
@@ -184,21 +211,91 @@ QString MediaController::getPreferredA2dpProfile() {
 }
 
 bool MediaController::restartWirePlumber() {
+  // Restarting the audio server kills every stream on the machine and blocks
+  // this (GUI) thread for 2s, so rate-limit it hard. Now that card resolution
+  // retries properly, reaching here at all should be rare.
+  if (m_lastWirePlumberRestart.isValid() &&
+      m_lastWirePlumberRestart.elapsed() < kWirePlumberRestartMinIntervalMs) {
+    LOG_WARN("Skipping WirePlumber restart; one was attempted "
+             << m_lastWirePlumberRestart.elapsed() << "ms ago");
+    return false;
+  }
+  m_lastWirePlumberRestart.start();
+
   LOG_INFO("Restarting WirePlumber to rediscover A2DP profiles");
-  int result = QProcess::execute("systemctl", QStringList() << "--user" << "restart" << "wireplumber");
-  if (result == 0) {
+  // Bounded wait: QProcess::execute() uses waitForFinished(-1), so a systemd
+  // user manager that is busy or wedged would freeze this (GUI) thread with no
+  // limit at all.
+  QProcess systemctl;
+  systemctl.start("systemctl", QStringList() << "--user" << "restart" << "wireplumber");
+  if (!systemctl.waitForFinished(kWirePlumberRestartTimeoutMs)) {
+    LOG_ERROR("systemctl restart wireplumber did not finish in time; killing it");
+    systemctl.kill();
+    systemctl.waitForFinished(1000);
+    return false;
+  }
+  if (systemctl.exitStatus() == QProcess::NormalExit && systemctl.exitCode() == 0) {
     LOG_INFO("WirePlumber restarted successfully");
     QThread::sleep(2);
     return true;
-  } else {
-    LOG_ERROR("Failed to restart WirePlumber. Do you use wireplumber?");
-    return false;
   }
+  LOG_ERROR("Failed to restart WirePlumber. Do you use wireplumber?");
+  return false;
 }
 
 void MediaController::activateA2dpProfile() {
-  if (connectedDeviceMacAddress.isEmpty() || m_deviceOutputName.isEmpty()) {
-    LOG_WARN("Connected device MAC address or output name is empty, cannot activate A2DP profile");
+  // Several entry points (startup, connect, wake, metadata, every ear-detection
+  // packet) can fire seconds apart. Without this guard each would start its own
+  // independent retry chain, and the last to resolve would win -- extending the
+  // window in which a stale chain can act on superseded state.
+  // Only refuse a duplicate of the CURRENT generation. Refusing across
+  // generations would drop the activation: the newer caller gets turned away
+  // while the older chain aborts on its generation check, and nothing runs.
+  if (m_a2dpPendingGeneration == m_a2dpGeneration) {
+    LOG_DEBUG("A2DP activation already in flight for this generation");
+    return;
+  }
+  activateA2dpProfileWithRetry(kA2dpActivationAttempts, m_a2dpGeneration);
+}
+
+// PipeWire creates the bluez card asynchronously, some seconds after the
+// Bluetooth link comes up, so the lookup done at connect time legitimately
+// misses. Re-resolve here and retry: the cached empty name must not become a
+// latch that blocks activation until the next ear-detection packet arrives.
+//
+// `generation` is a cancellation token. Anything that supersedes a pending
+// activation -- removing the pods, or a new device -- bumps m_a2dpGeneration,
+// so an in-flight chain aborts instead of switching the profile back on after
+// the user has already cased the pods.
+void MediaController::activateA2dpProfileWithRetry(int attemptsLeft, int generation) {
+  // Order matters: check for supersession BEFORE clearing the marker, so a
+  // stale chain's abort cannot clear a newer chain's marker and let a third
+  // caller start a duplicate.
+  if (generation != m_a2dpGeneration) {
+    LOG_DEBUG("A2DP activation superseded, abandoning chain");
+    return;
+  }
+  m_a2dpPendingGeneration = -1;
+
+  if (connectedDeviceMacAddress.isEmpty()) {
+    LOG_WARN("Connected device MAC address is empty, cannot activate A2DP profile");
+    return;
+  }
+
+  if (m_deviceOutputName.isEmpty()) {
+    m_deviceOutputName = getAudioDeviceName();
+  }
+
+  if (m_deviceOutputName.isEmpty()) {
+    if (attemptsLeft > 1) {
+      m_a2dpPendingGeneration = generation;
+      QTimer::singleShot(kA2dpActivationRetryMs, this, [this, attemptsLeft, generation]() {
+        activateA2dpProfileWithRetry(attemptsLeft - 1, generation);
+      });
+    } else {
+      LOG_ERROR("No Bluetooth card appeared for " << connectedDeviceMacAddress
+                << "; cannot activate A2DP profile");
+    }
     return;
   }
 
@@ -211,7 +308,17 @@ void MediaController::activateA2dpProfile() {
         return;
       }
     } else {
-      LOG_ERROR("Could not restart WirePlumber, A2DP profile unavailable");
+      // The restart was rate-limited or failed. Profiles are often just not
+      // enumerated yet, so re-arm rather than treating this as terminal --
+      // otherwise a transient gap ends activation for good.
+      if (attemptsLeft > 1) {
+        m_a2dpPendingGeneration = generation;
+        QTimer::singleShot(kA2dpActivationRetryMs, this, [this, attemptsLeft, generation]() {
+          activateA2dpProfileWithRetry(attemptsLeft - 1, generation);
+        });
+      } else {
+        LOG_ERROR("A2DP profile unavailable and WirePlumber restart unavailable");
+      }
       return;
     }
   }
@@ -222,26 +329,105 @@ void MediaController::activateA2dpProfile() {
     return;
   }
 
+  // Ear-detection packets repeat while the state is unchanged; re-setting an
+  // already-active profile only churns the sink, so make this idempotent.
+  // Any A2DP profile counts, not just the preferred one -- forcing a switch
+  // away from a working AAC/aptX/LDAC sink would tear it down mid-playback and
+  // silently downgrade the codec.
+  const QString activeProfile = m_pulseAudio->getActiveCardProfile(m_deviceOutputName);
+  if (activeProfile.startsWith("a2dp-sink")) {
+    LOG_DEBUG("An A2DP profile is already active: " << activeProfile);
+    m_weTurnedItOff = false;
+    return;
+  }
+
   LOG_INFO("Activating A2DP profile for AirPods: " << preferredProfile);
   if (!m_pulseAudio->setCardProfile(m_deviceOutputName, preferredProfile)) {
     LOG_ERROR("Failed to activate A2DP profile: " << preferredProfile);
+    // The card may have been destroyed under us; force a re-resolve next time
+    // rather than latching on a name that no longer exists.
+    m_deviceOutputName.clear();
+    return;
   }
+  m_weTurnedItOff = false;
   LOG_INFO("A2DP profile activated successfully");
 }
 
 void MediaController::removeAudioOutputDevice() {
-  if (connectedDeviceMacAddress.isEmpty() || m_deviceOutputName.isEmpty()) {
-    LOG_WARN("Connected device MAC address or output name is empty, cannot remove audio output device");
+  // Supersede any in-flight activation: the pods are out, so a chain still
+  // waiting for the card to appear must not switch A2DP back on behind us.
+  m_a2dpGeneration++;
+
+  if (connectedDeviceMacAddress.isEmpty()) {
+    LOG_WARN("Connected device MAC address is empty, cannot remove audio output device");
     return;
   }
-  
+
+  // Resolve the same way activation does. Bailing out on an empty name here
+  // while activation re-resolves would silently drop a removal issued during
+  // the window where the card has not appeared yet.
+  if (m_deviceOutputName.isEmpty()) {
+    m_deviceOutputName = getAudioDeviceName();
+  }
+  if (m_deviceOutputName.isEmpty()) {
+    LOG_DEBUG("No Bluetooth card for " << connectedDeviceMacAddress
+              << "; nothing to remove");
+    return;
+  }
+
+  if (m_pulseAudio->getActiveCardProfile(m_deviceOutputName) == "off") {
+    LOG_DEBUG("AirPods already removed as audio output device");
+    // We were asked to turn it off and it already is -- possibly an "off"
+    // persisted by an earlier session. Take ownership so shutdown still hands
+    // the profile back rather than leaving the card sinkless indefinitely.
+    m_weTurnedItOff = true;
+    return;
+  }
+
   LOG_INFO("Removing AirPods as audio output device");
   if (!m_pulseAudio->setCardProfile(m_deviceOutputName, "off")) {
     LOG_ERROR("Failed to remove AirPods as audio output device");
+    m_deviceOutputName.clear();
+    return;
   }
+  // WirePlumber persists this to ~/.local/state/wireplumber/default-profile,
+  // so it survives our process. Remember that we are the ones who set it, so
+  // shutdown can undo it rather than leaving the card with no sink.
+  m_weTurnedItOff = true;
+}
+
+void MediaController::restoreProfileIfWeTurnedItOff() {
+  if (!m_weTurnedItOff || m_deviceOutputName.isEmpty()) {
+    return;
+  }
+  if (m_pulseAudio->getActiveCardProfile(m_deviceOutputName) != "off") {
+    return; // something else already changed it; leave the user's choice alone
+  }
+  const QString profile = getPreferredA2dpProfile();
+  if (profile.isEmpty()) {
+    return;
+  }
+  LOG_INFO("Restoring A2DP profile on shutdown so the card is not left off: " << profile);
+  m_pulseAudio->setCardProfile(m_deviceOutputName, profile);
+  m_weTurnedItOff = false;
+}
+
+void MediaController::clearConnectedDevice() {
+  // Try to hand back the profile before dropping the state that records we owe
+  // it. Disconnect is the ordinary end of a listening session, so clearing the
+  // obligation here would mean the restore almost never runs.
+  restoreProfileIfWeTurnedItOff();
+  m_a2dpGeneration++;
+  m_a2dpPendingGeneration = -1;
+  connectedDeviceMacAddress.clear();
+  m_deviceOutputName.clear();
+  m_cachedA2dpProfile.clear();
+  m_weTurnedItOff = false;
 }
 
 void MediaController::setConnectedDeviceMacAddress(const QString &macAddress) {
+  // A new (or re-established) device supersedes any pending activation chain.
+  m_a2dpGeneration++;
   connectedDeviceMacAddress = macAddress;
   m_deviceOutputName = getAudioDeviceName();
   m_cachedA2dpProfile.clear();
@@ -405,6 +591,11 @@ void MediaController::pause()
 }
 
 MediaController::~MediaController() {
+  // Stopping while the pods are out of the ears would otherwise leave the card
+  // on a persisted "off" with no process left to undo it -- the user's AirPods
+  // would have no sink at all until they fixed it by hand. Restarting this
+  // service is routine (it is what a Qt rebuild requires), so this matters.
+  restoreProfileIfWeTurnedItOff();
 }
 
 QString MediaController::getAudioDeviceName()
@@ -413,7 +604,9 @@ QString MediaController::getAudioDeviceName()
 
   QString cardName = m_pulseAudio->getCardNameForDevice(connectedDeviceMacAddress);
   if (cardName.isEmpty()) {
-    LOG_ERROR("No matching Bluetooth card found for MAC address: " << connectedDeviceMacAddress);
+    // Expected while PipeWire is still creating the card; callers that retry
+    // report the terminal failure, so this is not an error on its own.
+    LOG_DEBUG("No matching Bluetooth card (yet) for MAC address: " << connectedDeviceMacAddress);
   }
   return cardName;
 }

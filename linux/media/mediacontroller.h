@@ -2,6 +2,7 @@
 #define MEDIACONTROLLER_H
 
 #include <QObject>
+#include <QElapsedTimer>
 #include "pulseaudiocontroller.h"
 
 class QProcess;
@@ -36,7 +37,10 @@ public:
   bool isActiveOutputDeviceAirPods();
   void handleConversationalAwareness(const QByteArray &data);
   void activateA2dpProfile();
+  void activateA2dpProfileWithRetry(int attemptsLeft, int generation);
   void removeAudioOutputDevice();
+  void restoreProfileIfWeTurnedItOff();
+  void clearConnectedDevice();
   void setConnectedDeviceMacAddress(const QString &macAddress);
   bool isA2dpProfileAvailable();
   QString getPreferredA2dpProfile();
@@ -65,6 +69,18 @@ private:
   PlayerStatusWatcher *playerStatusWatcher = nullptr;
   PulseAudioController *m_pulseAudio = nullptr;
   QString m_cachedA2dpProfile;
+  // Cancellation token for in-flight A2DP activation chains; bumped by anything
+  // that supersedes a pending activation.
+  int m_a2dpGeneration = 0;
+  // Generation of the chain currently in flight, or -1 for none. Must be
+  // generation-aware rather than a bare bool: a bool guard combined with a
+  // generation bump lets the new caller be refused while the old chain aborts,
+  // dropping the activation entirely.
+  int m_a2dpPendingGeneration = -1;
+  // True while the "off" profile we wrote is still in effect. WirePlumber
+  // persists that value, so shutdown must undo it or the card is left sinkless.
+  bool m_weTurnedItOff = false;
+  QElapsedTimer m_lastWirePlumberRestart;
 };
 
 #endif // MEDIACONTROLLER_H
