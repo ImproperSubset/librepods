@@ -358,8 +358,12 @@ void MediaController::activateA2dpProfileWithRetry(int attemptsLeft, int generat
     // recreates the sink, so doing this under a live stream would cut the
     // audio the profile is supposed to be carrying.
     if (m_pulseAudio->isDeviceSinkRunning(connectedDeviceMacAddress)) {
-      LOG_DEBUG("Leaving " << activeProfile
-                << " in place: a stream is running on it");
+      // Deliberately INFO, not DEBUG: this is the app declining to act on a
+      // mismatch it has already detected, and a refusal that leaves no trace
+      // is indistinguishable from the check never running. It fires only when
+      // a mismatch exists and audio is live, so it stays rare.
+      LOG_INFO("Leaving " << activeProfile
+               << " in place: a stream is running on it");
       return;
     }
     LOG_INFO("Correcting A2DP profile: asked for " << m_requestedProfile
