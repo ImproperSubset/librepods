@@ -20,6 +20,10 @@ constexpr int kA2dpActivationRetryMs = 500;
 // Restarting WirePlumber is machine-wide and blocking; never do it repeatedly.
 constexpr int kWirePlumberRestartMinIntervalMs = 60000;
 constexpr int kWirePlumberRestartTimeoutMs = 5000;
+// A profile request is accepted synchronously, but the BlueZ codec switch
+// behind it runs afterwards and has been seen to fail seven seconds later.
+// Re-read the card past that window rather than trusting the acceptance.
+constexpr int kA2dpVerifyDelayMs = 10000;
 }
 
 MediaController::MediaController(QObject *parent) : QObject(parent) {
@@ -336,9 +340,30 @@ void MediaController::activateA2dpProfileWithRetry(int attemptsLeft, int generat
   // silently downgrade the codec.
   const QString activeProfile = m_pulseAudio->getActiveCardProfile(m_deviceOutputName);
   if (activeProfile.startsWith("a2dp-sink")) {
-    LOG_DEBUG("An A2DP profile is already active: " << activeProfile);
     m_weTurnedItOff = false;
-    return;
+    // One A2DP profile is not somebody's choice: a request of ours that was
+    // accepted and then lost its codec switch, leaving WirePlumber to persist
+    // the fallback. Left alone it is inherited by every later connect, because
+    // the check above sees A2DP and stops. Everything else -- a profile the
+    // user picked, a better codec already negotiated -- stays untouched.
+    const bool ourRequestDidNotTake = !m_requestedProfile.isEmpty()
+                                      && m_requestedProfileMac == connectedDeviceMacAddress
+                                      && activeProfile != m_requestedProfile
+                                      && activeProfile != preferredProfile;
+    if (!ourRequestDidNotTake) {
+      LOG_DEBUG("An A2DP profile is already active: " << activeProfile);
+      return;
+    }
+    // Correct it only while nothing is playing to it. The switch destroys and
+    // recreates the sink, so doing this under a live stream would cut the
+    // audio the profile is supposed to be carrying.
+    if (m_pulseAudio->isDeviceSinkRunning(connectedDeviceMacAddress)) {
+      LOG_DEBUG("Leaving " << activeProfile
+                << " in place: a stream is running on it");
+      return;
+    }
+    LOG_INFO("Correcting A2DP profile: asked for " << m_requestedProfile
+             << ", card is on " << activeProfile);
   }
 
   LOG_INFO("Activating A2DP profile for AirPods: " << preferredProfile);
@@ -350,7 +375,39 @@ void MediaController::activateA2dpProfileWithRetry(int attemptsLeft, int generat
     return;
   }
   m_weTurnedItOff = false;
-  LOG_INFO("A2DP profile activated successfully");
+  m_requestedProfile = preferredProfile;
+  m_requestedProfileMac = connectedDeviceMacAddress;
+  LOG_INFO("A2DP profile request accepted: " << preferredProfile);
+  // Report what the card ended up on, not what it agreed to attempt.
+  const int generationAtRequest = m_a2dpGeneration;
+  QTimer::singleShot(kA2dpVerifyDelayMs, this,
+                     [this, preferredProfile, generationAtRequest]() {
+                       verifyA2dpProfileTook(preferredProfile, generationAtRequest);
+                     });
+}
+
+// Reads the card back once the BlueZ codec switch has had time to fail. A
+// mismatch is left recorded rather than corrected here: this runs ten seconds
+// after a connect, by which time a stream may be playing, and the activation
+// path corrects it at the next moment nothing is.
+void MediaController::verifyA2dpProfileTook(const QString &requested,
+                                            int generation) {
+  if (generation != m_a2dpGeneration || m_deviceOutputName.isEmpty()) {
+    return;
+  }
+  const QString active = m_pulseAudio->getActiveCardProfile(m_deviceOutputName);
+  if (active.isEmpty()) {
+    LOG_DEBUG("Cannot verify A2DP profile; card is gone");
+    return;
+  }
+  if (active == requested) {
+    LOG_INFO("A2DP profile confirmed active: " << requested);
+    return;
+  }
+  LOG_WARN("A2DP profile did not take: asked for "
+           << requested << ", card is on " << active
+           << ". WirePlumber persists this, so it is what later connects will "
+              "start from until an activation corrects it");
 }
 
 void MediaController::removeAudioOutputDevice() {

@@ -26,6 +26,7 @@ public:
     QString getCardNameForDevice(const QString &macAddress);
     QString getActiveCardProfile(const QString &cardName);
     bool isProfileAvailable(const QString &cardName, const QString &profileName);
+    bool isDeviceSinkRunning(const QString &macAddress);
 
 private:
     pa_threaded_mainloop *m_mainloop;

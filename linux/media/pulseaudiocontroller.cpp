@@ -565,6 +565,64 @@ bool PulseAudioController::isProfileAvailable(const QString &cardName, const QSt
     return data.available;
 }
 
+// True while a stream is attached and running on one of this device's sinks.
+// Changing a card profile destroys and recreates the sink under whatever is
+// playing, so a caller that would switch the profile for its own reasons asks
+// here first and leaves a live stream alone.
+bool PulseAudioController::isDeviceSinkRunning(const QString &macAddress)
+{
+    if (!m_initialized || macAddress.isEmpty()) return false;
+
+    struct CallbackData {
+        bool running;
+        QString targetMac;
+        pa_threaded_mainloop *mainloop;
+    } data;
+    data.running = false;
+    data.targetMac = macAddress;
+    data.mainloop = m_mainloop;
+
+    auto callback = [](pa_context *c, const pa_sink_info *info, int eol, void *userdata)
+    {
+        CallbackData *d = static_cast<CallbackData*>(userdata);
+        // This walks the whole sink list, so signal only at the end -- a
+        // per-entry signal would release the waiter before a later sink,
+        // which may be the running one, has been seen.
+        if (eol != 0) // eol < 0 is the error path; it must signal too
+        {
+            pa_threaded_mainloop_signal(d->mainloop, 0);
+            return;
+        }
+        if (!info) return;
+        // Same two property sources, in the same order, as
+        // getMacAddressBySinkName: device.string is what changed presentation
+        // across WirePlumber versions, and api.bluez5.address carries the same
+        // colon-form MAC when it does.
+        const char *addr = pa_proplist_gets(info->proplist, "device.string");
+        if (!addr)
+        {
+            addr = pa_proplist_gets(info->proplist, "api.bluez5.address");
+        }
+        if (addr
+            && QString::fromUtf8(addr).compare(d->targetMac, Qt::CaseInsensitive) == 0
+            && info->state == PA_SINK_RUNNING)
+        {
+            d->running = true;
+        }
+    };
+
+    pa_threaded_mainloop_lock(m_mainloop);
+    pa_operation *op = pa_context_get_sink_info_list(m_context, callback, &data);
+    if (op)
+    {
+        waitForOperation(op);
+        pa_operation_unref(op);
+    }
+    pa_threaded_mainloop_unlock(m_mainloop);
+
+    return data.running;
+}
+
 bool PulseAudioController::waitForOperation(pa_operation *op)
 {
     if (!op) return false;

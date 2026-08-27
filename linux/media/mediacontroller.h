@@ -38,6 +38,7 @@ public:
   void handleConversationalAwareness(const QByteArray &data);
   void activateA2dpProfile();
   void activateA2dpProfileWithRetry(int attemptsLeft, int generation);
+  void verifyA2dpProfileTook(const QString &requested, int generation);
   void removeAudioOutputDevice();
   void restoreProfileIfWeTurnedItOff();
   void clearConnectedDevice();
@@ -69,6 +70,18 @@ private:
   PlayerStatusWatcher *playerStatusWatcher = nullptr;
   PulseAudioController *m_pulseAudio = nullptr;
   QString m_cachedA2dpProfile;
+  // The profile this app last asked PulseAudio for. A request is accepted
+  // synchronously and the BlueZ codec switch behind it can still fail seconds
+  // later, after which WirePlumber persists whatever it fell back to. Holding
+  // the request is what tells a fallback we never chose apart from a profile
+  // somebody did choose.
+  QString m_requestedProfile;
+  // The device that request was made for. A disconnect clears
+  // connectedDeviceMacAddress, so the request cannot be scoped by comparing
+  // against it: the reconnect that follows is exactly when the correction is
+  // owed. Pairing it with its MAC keeps it across that gap while stopping a
+  // different device from inheriting it.
+  QString m_requestedProfileMac;
   // Cancellation token for in-flight A2DP activation chains; bumped by anything
   // that supersedes a pending activation.
   int m_a2dpGeneration = 0;
