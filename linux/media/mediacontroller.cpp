@@ -379,10 +379,9 @@ void MediaController::activateA2dpProfileWithRetry(int attemptsLeft, int generat
   m_requestedProfileMac = connectedDeviceMacAddress;
   LOG_INFO("A2DP profile request accepted: " << preferredProfile);
   // Report what the card ended up on, not what it agreed to attempt.
-  const int generationAtRequest = m_a2dpGeneration;
   QTimer::singleShot(kA2dpVerifyDelayMs, this,
-                     [this, preferredProfile, generationAtRequest]() {
-                       verifyA2dpProfileTook(preferredProfile, generationAtRequest);
+                     [this, preferredProfile, mac = connectedDeviceMacAddress]() {
+                       verifyA2dpProfileTook(preferredProfile, mac);
                      });
 }
 
@@ -391,8 +390,15 @@ void MediaController::activateA2dpProfileWithRetry(int attemptsLeft, int generat
 // after a connect, by which time a stream may be playing, and the activation
 // path corrects it at the next moment nothing is.
 void MediaController::verifyA2dpProfileTook(const QString &requested,
-                                            int generation) {
-  if (generation != m_a2dpGeneration || m_deviceOutputName.isEmpty()) {
+                                            const QString &mac) {
+  // Deliberately not the activation generation. That token is bumped by every
+  // ordinary re-trigger -- each metadata packet re-sets the connected device --
+  // including re-triggers that go on to change nothing, so checking it here
+  // cancels this read-back almost every time and the mismatch stays invisible.
+  // What actually invalidates the check is narrower: the device went away, or
+  // a newer request replaced this one, and that request schedules its own.
+  if (mac.isEmpty() || mac != connectedDeviceMacAddress
+      || requested != m_requestedProfile || m_deviceOutputName.isEmpty()) {
     return;
   }
   const QString active = m_pulseAudio->getActiveCardProfile(m_deviceOutputName);

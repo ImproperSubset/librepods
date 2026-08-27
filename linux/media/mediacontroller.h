@@ -38,7 +38,7 @@ public:
   void handleConversationalAwareness(const QByteArray &data);
   void activateA2dpProfile();
   void activateA2dpProfileWithRetry(int attemptsLeft, int generation);
-  void verifyA2dpProfileTook(const QString &requested, int generation);
+  void verifyA2dpProfileTook(const QString &requested, const QString &mac);
   void removeAudioOutputDevice();
   void restoreProfileIfWeTurnedItOff();
   void clearConnectedDevice();
