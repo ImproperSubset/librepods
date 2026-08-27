@@ -1040,25 +1040,41 @@ public:
             return;
         }
 
-        if (force) {
-            LOG_INFO("Forcing connection to AirPods");
-            QProcess process;
-            process.start("bluetoothctl", QStringList() << "connect" << m_deviceInfo->bluetoothAddress());
-            process.waitForFinished();
-            QString output = process.readAllStandardOutput().trimmed();
-            LOG_INFO("Bluetoothctl output: " << output);
+        if (!monitor) {
+            LOG_WARN("Bluetooth monitor not ready; cannot take over audio");
+            return;
         }
-        QBluetoothLocalDevice localDevice;
-        const QList<QBluetoothAddress> connectedDevices = localDevice.connectedDevices();
-        for (const QBluetoothAddress &address : connectedDevices) {
-            QBluetoothDeviceInfo device(address, "", 0);
-            LOG_DEBUG("Connected device: " << device.name() << " (" << device.address().toString() << ")");
-            if (isAirPodsDevice(device)) {
-                connectToDevice(device);
-                return;
-            }
+
+        // Resolve the target from BlueZ rather than from m_deviceInfo:
+        // onDeviceDisconnected calls DeviceInfo::reset(), which clears the
+        // stored address, so by the time a takeover is wanted the address is
+        // empty -- which is exactly when this path is reached.
+        const BluetoothMonitor::AirPodsDevice device = monitor->findPairedAirPods();
+        if (!device.isValid()) {
+            LOG_WARN("No paired AirPods known to BlueZ; cannot take over audio");
+            return;
         }
-        LOG_WARN("AirPods not found among connected devices");
+
+        if (device.connected) {
+            // Already up at the Bluetooth level but with no AAP socket -- e.g.
+            // the L2CAP socket died without a BT disconnect. Calling Connect
+            // here would change no property, so no PropertiesChanged would
+            // fire and the takeover would silently do nothing. Re-emitting
+            // deviceConnected drives the normal socket path instead.
+            LOG_INFO("AirPods already connected at the Bluetooth level; re-establishing session");
+            monitor->checkAlreadyConnectedDevices();
+            return;
+        }
+
+        if (!force) {
+            LOG_INFO("AirPods not connected and takeover not forced; leaving them alone");
+            return;
+        }
+
+        LOG_INFO("Forcing connection to AirPods: " << device.address);
+        // Asynchronous. The AAP socket is not established here: BlueZ emitting
+        // Connected drives BluetoothMonitor::deviceConnected.
+        monitor->connectDeviceByPath(device.path, device.address);
     }
 
     void initializeBluetooth() {
@@ -1112,7 +1128,7 @@ private:
     QByteArray lastEarDetectionStatus;
     MediaController* mediaController;
     TrayIconManager *trayManager;
-    BluetoothMonitor *monitor;
+    BluetoothMonitor *monitor = nullptr;
     QSettings *m_settings;
     AutoStartManager *m_autoStartManager;
     int m_retryAttempts = 3;
