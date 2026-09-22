@@ -1009,9 +1009,18 @@ private slots:
 public:
     void handleMediaStateChange(MediaController::MediaState state) {
         if (state == MediaController::MediaState::Playing) {
-            LOG_INFO("Media started playing, sending disconnect request to Android and taking over audio");
-            sendDisconnectRequestToAndroid();
-            connectToAirPods(true);
+            // A host that does not take the pods over still wants the repair
+            // path: connectToAirPods(false) re-establishes a dead AAP socket on
+            // pods already connected here, and leaves pods held elsewhere --
+            // or sitting in the case -- alone.
+            const bool force = m_settings->value("mediaTakeover/forceConnect", true).toBool();
+            if (force) {
+                LOG_INFO("Media started playing, sending disconnect request to Android and taking over audio");
+                sendDisconnectRequestToAndroid();
+            } else {
+                LOG_DEBUG("Media started playing; takeover disabled by mediaTakeover/forceConnect");
+            }
+            connectToAirPods(force);
         }
     }
 
