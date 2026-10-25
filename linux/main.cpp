@@ -794,7 +794,16 @@ private slots:
 
     void parseData(const QByteArray &data)
     {
-        LOG_DEBUG("Received: " << data.toHex());
+        // The Magic Cloud Keys packet carries the pods' IRK and encryption key;
+        // its bytes must not reach the journal, even in debug mode.
+        if (data.startsWith(AirPodsPackets::MagicPairing::MAGIC_CLOUD_KEYS_HEADER))
+        {
+            LOG_DEBUG("Received: Magic Cloud Keys packet (" << data.size() << " bytes, redacted)");
+        }
+        else
+        {
+            LOG_DEBUG("Received: " << data.toHex());
+        }
 
         if (data.startsWith(AirPodsPackets::Parse::HANDSHAKE_ACK))
         {
@@ -814,9 +823,8 @@ private slots:
         else if (data.startsWith(AirPodsPackets::MagicPairing::MAGIC_CLOUD_KEYS_HEADER))
         {
             auto keys = AirPodsPackets::MagicPairing::parseMagicCloudKeysPacket(data);
-            LOG_INFO("Received Magic Cloud Keys:");
-            LOG_INFO("MagicAccIRK: " << keys.magicAccIRK.toHex());
-            LOG_INFO("MagicAccEncKey: " << keys.magicAccEncKey.toHex());
+            LOG_INFO("Received Magic Cloud Keys (IRK " << keys.magicAccIRK.size()
+                     << " bytes, encryption key " << keys.magicAccEncKey.size() << " bytes)");
 
             // Store the keys
             m_deviceInfo->setMagicAccIRK(keys.magicAccIRK);
