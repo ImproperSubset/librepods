@@ -556,8 +556,18 @@ private slots:
 
         // After system reboot, AirPods might be connected but A2DP profile not active
         // Attempt to activate A2DP profile after a delay to ensure connection is established
-        QTimer::singleShot(2000, this, [this, address]()
+        // A device that drops inside the delay must not have its profile
+        // activated afterwards. m_connectionGeneration cannot gate this: a
+        // successful socket connect bumps it too, which would cancel the
+        // activation on every normal connect.
+        const int disconnectGeneration = m_disconnectGeneration;
+        QTimer::singleShot(2000, this, [this, address, disconnectGeneration]()
         {
+            if (disconnectGeneration != m_disconnectGeneration)
+            {
+                LOG_DEBUG("Device disconnected before A2DP activation; skipping");
+                return;
+            }
             if (!address.isEmpty())
             {
                 mediaController->setConnectedDeviceMacAddress(address);
@@ -586,6 +596,7 @@ private slots:
         // Deliberately no bare `m_retryCount = 0` here: an unconditional refund
         // is what let a flapping device retry without bound.
         m_connectionGeneration++;
+        m_disconnectGeneration++;
         // The bluez card is gone; a cached card name here would make every
         // later profile call target a destroyed card.
         mediaController->clearConnectedDevice();
@@ -1148,6 +1159,9 @@ private:
     // configured (the original defect: a function-local `static`).
     int m_retryCount = 0;
     int m_connectionGeneration = 0;
+    // Bumped only by a disconnect, so a delayed per-connect action can tell
+    // whether its device went away in the meantime.
+    int m_disconnectGeneration = 0;
     bool m_hideOnStart = false;
     DeviceInfo *m_deviceInfo;
     BleManager *m_bleManager;
